@@ -17,21 +17,26 @@ use crc::{Crc, CRC_16_XMODEM};
 pub const CRC_XMODEM: Crc<u16> = Crc::<u16>::new(&CRC_16_XMODEM);
 
 struct Client {
-    stream: TcpStream,
     rb: BufReader<TcpStream>,
     wb: BufWriter<TcpStream>
 }
 
 impl Client {
     fn new(stream: TcpStream) -> Client {
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream.set_nodelay(true).unwrap();
         let rb = BufReader::new(stream.try_clone().unwrap());
         let wb = BufWriter::new(stream.try_clone().unwrap());
-        return Client { stream, rb, wb };
+        return Client { rb, wb };
+    }
+    fn enable_timeout(&mut self) {
+        self.rb.get_ref().set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    }
+    fn disable_timeout(&mut self) {
+        self.rb.get_ref().set_read_timeout(None).unwrap();
     }
     fn write_str(&mut self, s: &str) {
         let (encoded, _, _) = SHIFT_JIS.encode(s);
-        self.stream.write_all(&encoded).unwrap();
+        self.wb.write_all(&encoded).unwrap();
     }
     fn write_line(&mut self, s: &str) {
         self.write_str(s);
@@ -41,17 +46,11 @@ impl Client {
         let mut b = String::new();
         self.rb.read_line(&mut b).unwrap();
     }
-    fn _echo_infinite(&mut self) {
-        loop {
-            let mut b = [0; 1];
-            self.rb.read_exact(&mut b).unwrap();
-            self.stream.write_all(&b).unwrap();
-        }
-    }
     // TODO: make this not hang indefinitely on loss of connection
     // this actually returns a string but we might need to change that
     // as arrow keys etc aren't sjis strings
     fn get_key(&mut self) -> String {
+        self.flush();
         let mut b = [0; 1];
         loop {
             if let Ok(()) = self.rb.read_exact(&mut b) {
@@ -66,16 +65,39 @@ impl Client {
         Ok(b[0])
     }
     fn readline(&mut self) -> Result<String, std::io::Error> {
+        self.flush();
         let mut s = String::new();
         loop {
             let k = self.get_key();
             self.write_str(&k);
-            self.wb.flush()?;
+            self.flush();
             if k == "\r" {
                 return Ok(String::from(s.trim()));
             }
             s.push_str(&k);
         }
+    }
+    fn cls(&mut self) {
+        self.wb.write_all(b"\x1b[2J\x1b[H").ok();
+    }
+    fn cup(&mut self, n: usize, m: usize) {
+        self.write_str(&format!("\x1b[{};{}H", n, m));
+    }
+    fn invert(&mut self) {
+        self.wb.write_all(b"\x1b[7m").ok();
+    }
+    fn normal(&mut self) {
+        self.wb.write_all(b"\x1b[0m").ok();
+    }
+    fn flush(&mut self) {
+        self.wb.flush().ok();
+        self.wb.get_ref().flush().ok();
+    }
+    fn _disable_line_wrap(&mut self) {
+        self.wb.write_all(b"\x1b[7l").ok();
+    }
+    fn _reset(&mut self) {
+        self.wb.write_all(b"\x1bc").ok();
     }
 }
 
@@ -88,6 +110,45 @@ fn file_list(c: &mut Client) {
     }
 }
 
+fn browse_files(c: &mut Client) -> Result<(), std::io::Error> {
+    let mut selected_index = 0;
+    let file_names = fs::read_dir("./files/").unwrap().map(|x| x.unwrap().file_name()).collect::<Vec<_>>();
+    loop {
+        c.cls();
+        for (i, path) in file_names.iter().enumerate() {
+            if i == selected_index {
+                c.invert();
+            }
+            c.write_line(&path.to_str().unwrap());
+            if i == selected_index {
+                c.normal();
+            }
+        }
+        c.cup(25,1);
+        c.invert();
+        c.write_str(&format!("{:79}","WASD: move  Return: download  Q: quit browser"));
+        c.normal();
+        c.flush();
+        let k = c.get_key();
+        match k.as_str() {
+            "q" => {
+                c.cls();
+                return Ok(());
+            }
+            "w" => {
+                selected_index = selected_index.saturating_sub(1);
+            }
+            "s" => {
+                selected_index = (selected_index + 1).min(file_names.len() - 1);
+            }
+            "\r" => {
+                ymodem_send(c, &PathBuf::from("./files/").join(&file_names[selected_index]))?;
+            }
+            _ => {}
+        }
+    }
+}
+
 fn xmodem_send_packet_crc(n: u8, d: &[u8; 128], c: &mut Client) {
     println!("sending xmodem packet");
     let checksum = CRC_XMODEM.checksum(d);
@@ -96,7 +157,7 @@ fn xmodem_send_packet_crc(n: u8, d: &[u8; 128], c: &mut Client) {
         c.wb.write_all(&[n, 0xFF-n]).unwrap();
         c.wb.write_all(d).unwrap();
         c.wb.write_all(&checksum.to_be_bytes()).unwrap();
-        c.wb.flush().unwrap();
+        c.flush();
         if c.get_byte().unwrap() == 0x06 {
             println!("got ack");
             break;
@@ -113,7 +174,7 @@ fn xmodem_send_packet_crc_1k(n: u8, d: &[u8; 1024], c: &mut Client) {
         c.wb.write_all(&[n, 0xFF-n]).unwrap();
         c.wb.write_all(d).unwrap();
         c.wb.write_all(&checksum.to_be_bytes()).unwrap();
-        c.wb.flush().unwrap();
+        c.flush();
         if c.get_byte().unwrap() == 0x06 {
             println!("got ack");
             break;
@@ -129,13 +190,13 @@ fn xmodem_receive_packet_crc(c: &mut Client) -> Result<Vec<u8>,std::io::Error> {
         if start_byte == 0x04 {
             println!("got end of transmission");
             c.wb.write_all(&[0x06])?;
-            c.wb.flush()?;
+            c.flush();
             return Ok(vec![0; 0]); // indicates an end of the current file
         }
         if (start_byte != 0x01) && (start_byte != 0x02) {
             println!("got bad packet start byte");
             c.wb.write_all(&[0x15])?;
-            c.wb.flush()?;
+            c.flush();
             continue;
         }
         let n = c.get_byte()?;
@@ -143,7 +204,7 @@ fn xmodem_receive_packet_crc(c: &mut Client) -> Result<Vec<u8>,std::io::Error> {
         if n.wrapping_add(n2) != 0xFF {
             println!("mismatched packet numbers");
             c.wb.write_all(&[0x015])?;
-            c.wb.flush()?;
+            c.flush();
             continue;
         }
         let mut data = match start_byte {
@@ -157,13 +218,13 @@ fn xmodem_receive_packet_crc(c: &mut Client) -> Result<Vec<u8>,std::io::Error> {
         c.rb.read_exact(&mut recv_checksum)?;
         if recv_checksum != checksum.to_be_bytes() {
             c.wb.write_all(&[0x15])?;
-            c.wb.flush()?;
+            c.flush();
             println!("failed checksum");
             continue;
         }
         c.wb.write_all(&[0x06])?; // ack
         println!("sent packet ack");
-        c.wb.flush()?;
+        c.flush();
         return Ok(data);
     }
 }
@@ -201,9 +262,12 @@ fn _xmodem_send(c: &mut Client) {
 }
 
 fn ymodem_send(c: &mut Client, path: &PathBuf) -> Result<(), std::io::Error> {
+    c.write_line("Downloading file!");
+    c.write_line("Please enable YMODEM file download now (muterm: F5)");
+    c.flush();
     let mut file = fs::File::open(path)?;
+    let b = c.get_byte()?;
     loop {
-        let b = c.get_byte()?;
         match b {
             0x43 => {
                 println!("got request for XMODEM-CRC");
@@ -211,8 +275,8 @@ fn ymodem_send(c: &mut Client, path: &PathBuf) -> Result<(), std::io::Error> {
                 let mut first_chunk = Vec::new();
                 first_chunk.write(&encoded_filename).unwrap();
                 first_chunk.write(&[0]).unwrap();
-                first_chunk.write(&vec![0; 1024 - first_chunk.len()]).unwrap();
-                xmodem_send_packet_crc_1k(0, &first_chunk[0..1024].try_into().unwrap(), c);
+                first_chunk.write(&vec![0; 128 - first_chunk.len()]).unwrap();
+                xmodem_send_packet_crc(0, &first_chunk[0..128].try_into().unwrap(), c);
                 let mut packet_no: u8 = 1;
                 loop {
                     let mut chunk = [0x26; 1024];
@@ -228,11 +292,11 @@ fn ymodem_send(c: &mut Client, path: &PathBuf) -> Result<(), std::io::Error> {
                     if bytes_read < 1024 { break; }
                 }
                 c.wb.write_all(&[0x04]).unwrap();
-                c.wb.flush().unwrap();
+                c.flush();
                 let _ = c.get_byte().unwrap(); // consume last ack
                 // send end of files
                 xmodem_send_packet_crc(0, &[0; 128], c);
-                c.wb.flush().unwrap();
+                c.flush();
                 return Ok(());
             }
             0x0a => {},
@@ -241,6 +305,7 @@ fn ymodem_send(c: &mut Client, path: &PathBuf) -> Result<(), std::io::Error> {
                 // don't know how to handle these
                 eprintln!("Got unrecognized transfer type during xmodem transfer: {:02x}", b);
                 c.write_line(&format!("Got unrecognized transfer type {:02x}, only XMODEM-CRC is currently supported.", b));
+                c.flush();
                 break;
             }
         }
@@ -250,11 +315,13 @@ fn ymodem_send(c: &mut Client, path: &PathBuf) -> Result<(), std::io::Error> {
 
 fn ymodem_receive(c: &mut Client, path: &PathBuf) -> Result<(), std::io::Error> {
     loop {
+        c.enable_timeout();
         c.wb.write_all(&[0x43])?;
         c.wb.flush()?;
         if let Ok(header_packet) = xmodem_receive_packet_crc(c) {
             if header_packet[0] == 0 {
                 // end of files
+                c.disable_timeout();
                 return Ok(());
             }
             let mut filename_bytes = Vec::new();
@@ -268,6 +335,7 @@ fn ymodem_receive(c: &mut Client, path: &PathBuf) -> Result<(), std::io::Error> 
             let (decoded_filename, _, _) = SHIFT_JIS.decode(&filename_bytes);
             file_path.push(decoded_filename.to_string());
             if !file_path.canonicalize()?.starts_with(path.canonicalize()?) {
+                c.disable_timeout();
                 return Err(std::io::Error::from(std::io::ErrorKind::Other));
             }
             let mut file = std::fs::File::create(file_path)?;
@@ -287,8 +355,6 @@ fn ymodem_receive(c: &mut Client, path: &PathBuf) -> Result<(), std::io::Error> 
 fn download_file(c: &mut Client) {
     c.write_line("Please enter file name to download:");
     let filename = c.readline().unwrap();
-    c.write_line("Downloading file!");
-    c.write_line("Please enable YMODEM file download now (muterm: F5)");
     ymodem_send(c, &PathBuf::from("./files/").join(&filename)).unwrap();
 }
 
@@ -311,6 +377,7 @@ fn handle_client(config: Config, stream: TcpStream) {
     loop {
         c.write_line("Main menu:");
         c.write_line("l: list files");
+        c.write_line("b: browse files");
         c.write_line("d: download file");
         c.write_line("u: upload files");
         c.write_line("q: quit");
@@ -318,6 +385,9 @@ fn handle_client(config: Config, stream: TcpStream) {
         match key.as_str() {
             "l" => {
                 file_list(&mut c);
+            },
+            "b" => {
+                browse_files(&mut c).unwrap();
             },
             "q" => {
                 c.write_line("Bye!");
@@ -338,7 +408,8 @@ fn handle_client(config: Config, stream: TcpStream) {
 
 #[derive(Deserialize, Clone)]
 struct Config {
-    system_password: String
+    system_password: String,
+    bind: String
 }
 
 fn main() -> std::io::Result<()> {
@@ -346,7 +417,7 @@ fn main() -> std::io::Result<()> {
     std::fs::File::open("config.toml")?.read_to_string(&mut config_str)?;
     let config: Config = toml::from_str(&config_str)?;
 
-    let listener = TcpListener::bind("0.0.0.0:6800")?;
+    let listener = TcpListener::bind(&config.bind)?;
 
     // accept connections and process them serially
     for stream in listener.incoming() {
